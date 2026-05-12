@@ -5608,7 +5608,7 @@ void devConfigTask(void)
 					status = 0;
 					unSendDataPacket = 0;
 					curGprsSendAddr  = sensorDataWriteAddr;
-					printf("\r\n���δ���ʹ�����");
+					printf("\r\nData reset complete");
 				}
 			}
 		}
@@ -5769,7 +5769,7 @@ void Config_Menu(void)
 			if(key == 0x35)//'5'
 			{
 				waitTimes	=	0;
-				devPutString((uint8_t*)"\r\n  �����������ģʽ-----------\r\n\n");
+				devPutString((uint8_t*)"\r\n  Entering config mode-----------\r\n\n");
 				devConfigTask();			
 			}
 			else if((key == 'a')||(key == 'A'))

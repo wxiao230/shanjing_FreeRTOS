@@ -127,8 +127,9 @@
      Internal SRAM. */ 
 /* #define VECT_TAB_SRAM */
 #ifndef VECT_TAB_OFFSET
-#define VECT_TAB_OFFSET  0x0 /*!< Vector Table base offset field. 
-                                  This value must be a multiple of 0x200. */
+#define VECT_TAB_OFFSET  0x3000 /*!< Vector Table base offset field. 
+                                     Bootloader occupies 0x08000000-0x08002FFF (12KB).
+                                     This value must be a multiple of 0x200. */
 #endif
 /**
   * @}
