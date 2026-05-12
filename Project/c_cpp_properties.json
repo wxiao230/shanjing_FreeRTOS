@@ -1,0 +1,29 @@
+{
+    "configurations": [
+        {
+            "name": "Win64",
+            "includePath": [
+                "${workspaceFolder}/**",  // 自动识别当前项目所有头文件
+                "${workspaceFolder}/inc",// 项目公共头文件路径                 
+                "${workspaceFolder}/lib/Libraries/CMSIS/include",  // CMSIS核心头文件路径
+                "${workspaceFolder}/lib/Libraries/CMSIS/device/ST/STM32L1xx/Include",  // CMSIS设备头文件路径
+                "${workspaceFolder}/lib/Libraries/STM32L1xx_StdPeriph_Driver/inc",  // 标准库头文件路径
+                "${workspaceFolder}/lib/FreeRTOS",  // FreeRTOS头文件路径
+                "${workspaceFolder}/lib/FreeRTOS/include",  // FreeRTOS移植层头文件路径
+                "${workspaceFolder}/lib/FreeRTOS/portable",  // FreeRTOS移植层头文件路径             
+                "${workspaceFolder}/lib/FreeRTOS/portable/GCC/ARM_CM3",  // FreeRTOS移植层头文件路径
+                "E:/Tools/arm-gnu-toolchain/arm-none-eabi/include"  // 工具链头文件路径
+            ],
+            "defines": [
+                "USE_IAP_BOOT", // 定义使用IAP引导程序
+                "STM32L1XX_MDP",  // 替换为自己的芯片型号（如STM32L431xx）
+                "USE_STDPERIPH_DRIVER"  // 使用标准库（裸机项目可删除此条）
+            ],
+            "compilerPath": "E:/Tools/arm-gnu-toolchain/bin/arm-none-eabi-gcc.exe",  // 编译器路径
+            "cStandard": "c99",  // 嵌入式C语言标准（固定c99）
+            "cppStandard": "c++11",  // 若用C++开发，可保留
+            "intelliSenseMode": "windows-msvc-x64"
+        }
+    ],
+    "version": 4
+}
