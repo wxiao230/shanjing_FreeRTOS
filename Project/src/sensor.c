@@ -895,14 +895,7 @@ void signPacketNumSel(void)
 }
 
 
-static void delay_powerMs(uint32_t delay)
-{
-    uint16_t i;
-	while(delay--)
-	{
-	for(i=0;i<8300;i++);
-	}
-}
+/* delay_powerMs() removed — use delay_ms() which automatically yields when scheduler is running */
 
 void depPrintf(void)
 {
@@ -947,12 +940,12 @@ void cal_sensor(void)
 #if((GPRS_SLEEP_CTR>0)&&(MQTT_TEST_SCH_CTR>0))
 	if(sampleTestFlag == 1)
 	{
-		delay_powerMs(200);
+			delay_ms(200);
 	}
 	else
 #endif
 	{
-		delay_powerMs(500);
+		delay_ms(500);
 	}
 	readAllTemperature();
 
@@ -977,7 +970,7 @@ void cal_sensor(void)
 		#if((GPRS_SLEEP_CTR>0)&&(MQTT_TEST_SCH_CTR>0))
 			if(sampleTestFlag == 1)
 			{
-				delay_powerMs(100);
+				delay_ms(100);
 				calSensorState = CAL_ON;
 			}
 		#endif
@@ -992,6 +985,7 @@ void cal_sensor(void)
 				{
 					break;
 				}
+				vTaskDelay(1); /* yield 1ms per iteration to allow lower-priority tasks to run */
 			}
 			sel_sensor(j,SENSOR_OFF);
 			if(j == 0x00)
