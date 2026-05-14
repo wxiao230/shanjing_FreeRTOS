@@ -1,631 +1,374 @@
-# 代码审查报告 (Code Review Report)
+---
+phase: code-review
+reviewed: 2026-05-14T00:00:00Z
+depth: deep
+files_reviewed: 6
+files_reviewed_list:
+  - Project/src/main.c
+  - Project/src/gprs.c
+  - Project/src/sensor.c
+  - Project/src/stm32l1xx_it.c
+  - Project/inc/FreeRTOSConfig.h
+  - Project/src/delay.c
+findings:
+  critical: 8
+  warning: 12
+  info: 6
+  total: 26
+status: issues_found
+---
 
-**项目**: 地质灾害监测设备固件 (FreeRTOS 版本)  
-**审查日期**: 2026-05-12  
-**审查标准**: MISRA C:2012, CERT C, FreeRTOS 最佳实践, 嵌入式安全  
-**审查范围**: Project/src/*.c, Project/inc/*.h, FreeRTOSConfig.h  
+# Phase Code Review Report
+
+**Reviewed:** 2026-05-14
+**Depth:** deep
+**Files Reviewed:** 6
+**Status:** issues_found
+
+## Summary
+
+This review covers the core FreeRTOS-based firmware for the shanjing soil-monitoring device. The codebase is extensive (~18K lines in gprs.c alone) and handles GPRS/MQTT communication, sensor sampling, power management, and flash storage. Multiple **Critical** issues were found including ISR-unsafe shared memory access, semaphore leaks, undefined behavior in string search routines, and unbounded buffer operations. The code shows evidence of iterative development with many commented-out sections and inconsistent use of the `safe_sprintf` wrapper that was added but never adopted.
 
 ---
 
-## 执行摘要
+## Critical Issues
 
-| 等级 | 数量 | 已修复 | 说明 |
-|------|------|--------|------|
-| 🔴 **严重 (Critical)** | 5 | 4/5 | 可导致系统崩溃、数据丢失或安全漏洞 |
-| 🟠 **高 (High)** | 8 | 6/8 | 可能导致不稳定、内存损坏或功能异常 |
-| 🟡 **中 (Medium)** | 6 | 0/6 | 潜在问题，建议改进 |
-| 🟢 **低 (Low)** | 4 | 0/4 | 代码质量建议 |
+### CR-01: Semaphore Leak in monitorTask — xADXL345Semaphore Never Released
 
-**总体评估**: 代码功能完整但存在多个严重的安全和可靠性问题。已修复大部分 Critical 和 High 问题，**CR-001 (sprintf 缓冲区溢出) 需持续改进**。
-
----
-
-## 🔴 Critical (严重)
-
-### CR-001: gprs.c 大量 sprintf 调用无边界检查 — 缓冲区溢出风险
-
-**位置**: `Project/src/gprs.c` (463+ 处)  
-**标准**: CERT C INT31-C, MISRA C:2012 Rule 21.6
-
-**问题描述**:  
-gprs.c 中大量使用 `sprintf()` 拼接 AT 命令和 HTTP 数据包，绝大多数调用没有检查目标缓冲区大小。例如：
-
+**File:** `Project/src/main.c:647`
+**Issue:** `monitorTask` takes `xADXL345Semaphore` at line 647 but never calls `xSemaphoreGive()` before the function returns to the top of its infinite loop. Once the semaphore is taken, no other task (including `monitorTask` itself on subsequent iterations) can ever acquire it again. This causes the ADXL345 monitoring logic to execute exactly once and then deadlock.
+**Fix:**
 ```c
-// gprs.c:230
-bufLength = sprintf(tcpServerAddrBuf[TCP_SERVER_INSENTEK].sendAddressBuf+datalength, 
-                    "%s", "AT+CIPOPEN=0,\"TCP\",\"api.insentek.com\",54862\r\n");
-```
-
-`sendAddressBuf` 大小固定（约 100 字节），如果 `datalength` 接近上限，此调用将溢出。
-
-**影响**:  
-- 栈缓冲区溢出可导致 HardFault
-- 攻击者可通过控制服务器响应内容触发溢出（如果响应被复制到缓冲区）
-- 数据包格式错误导致通信失败
-
-**修复建议**:  
-1. 所有 `sprintf` 替换为 `snprintf`，明确传入缓冲区剩余大小
-2. 添加返回值检查，确保写入长度不超过可用空间
-3. 对 `datalength` 等偏移量添加前置边界检查
-
-```c
-// 修复示例
-size_t remaining = sizeof(buf) - datalength;
-int len = snprintf(buf + datalength, remaining, "%s", "AT+...\r\n");
-if (len < 0 || (size_t)len >= remaining) {
-    // 处理溢出错误
+if(xSemaphoreTake(xADXL345Semaphore, pdMS_TO_TICKS(1000)) == pdTRUE)
+{
+    // ... existing ADXL345 logic ...
+    xSemaphoreGive(xADXL345Semaphore);  // ADD THIS
 }
 ```
 
-**优先级**: P0 — 必须在生产前修复
+### CR-02: ISR-Unsafe Global State Mutation in TIM2_IRQHandler
 
----
-
-### CR-002: 中断处理程序中调用 printf — ISR 不安全
-
-**位置**: `Project/src/stm32l1xx_it.c` (lines 20-48)  
-**标准**: FreeRTOS 最佳实践, MISRA C:2012 Rule 1.3
-
-**问题描述**:  
-`NMI_Handler`、`HardFault_Handler`、`MemManage_Handler` 中直接调用 `printf()`：
-
+**File:** `Project/src/stm32l1xx_it.c:110`
+**Issue:** `TIM2_IRQHandler` calls `cal_work()` which modifies the global variables `calSensorState`, `timeLocal`, and `keyLocal` (defined in `sensor.c`). These same variables are read and written by `cal_sensor()` running in the `sensorTask` task context. There is no critical section, atomic access, or volatile-qualified pointer protection. This is a classic race condition that can corrupt sensor sampling state.
+**Fix:** Wrap the `cal_work()` call in a critical section or use a FreeRTOS stream buffer/queue to pass timing events from ISR to task:
 ```c
-void HardFault_Handler(void)
+void TIM2_IRQHandler(void)
 {
-    while (1)
+    if (TIM_GetITStatus(TIM2, TIM_IT_Update) != RESET)
     {
-        rstStatus = RST_STATUS_Hard;
-        devUSART_RUN();
-        printf("\r\n swReset:%d HardFault_Handler\r\n", rstStatus);  // ❌ ISR 中调用 printf
-        reboot1task();
+        UBaseType_t uxSavedInterruptStatus = taskENTER_CRITICAL_FROM_ISR();
+        cal_work();
+        taskEXIT_CRITICAL_FROM_ISR(uxSavedInterruptStatus);
+    }
+    TIM_ClearITPendingBit(TIM2, TIM_IT_Update);
+}
+```
+
+### CR-03: Unprotected GPRS Ring Buffer Access from USART1_IRQHandler
+
+**File:** `Project/src/stm32l1xx_it.c:153-178` and `Project/src/gprs.c:304-321`
+**Issue:** `USART1_IRQHandler` calls `gprsReceive()` which writes to `GPRS_RX_Buffer[]` and increments `GPRS_RX_ptr_Store`. Task-level code in `gprs.c` (e.g., `findStrRxGprs`, `gprsRxcounterCal`) reads these same variables without any critical section. On a 32-bit Cortex-M3, `uint16_t` increments are not atomic when compiled with optimizations, leading to torn reads and buffer corruption.
+**Fix:** Use `taskENTER_CRITICAL_FROM_ISR()` / `taskEXIT_CRITICAL_FROM_ISR()` around the buffer pointer update in `gprsReceive()`, or use a FreeRTOS stream buffer for ISR-to-task data transfer.
+
+### CR-04: Undefined Behavior in findStrRxGprsFromHead100 — Uninitialized Variable
+
+**File:** `Project/src/gprs.c:4682-4738`
+**Issue:** The local variable `conuter` is declared at line 4688 but **never assigned a value** before being used in the check `if(bufLength > conuter)` at line 4703. Because `conuter` is uninitialized, the function has undefined behavior and may incorrectly return `FIND_ERROR` or proceed with an arbitrary loop bound, causing buffer overruns or missed matches.
+**Fix:**
+```c
+uint16_t findStrRxGprsFromHead100(uint8_t *buf, uint8_t bufLength)
+{
+    // ...
+    uint32_t conuter = gprsRxcounterCal(GPRS_RX_ptr_Out);  // Initialize it!
+    if(bufLength > conuter)
+    {
+        return FIND_ERROR;
+    }
+    // ...
+}
+```
+
+### CR-05: Buffer Overflow in sensorTask sprintf with Fixed 30-Byte Buffer
+
+**File:** `Project/src/main.c:394-396`
+**Issue:**
+```c
+char buftmp[30];
+sprintf(buftmp,"QY:%.2f,%.2f,%.2f",xlResult[32].xg,xlResult[32].yg,xlResult[32].zg);
+```
+With three `double` values formatted to 2 decimal places, each can produce strings like `-123456789012345.67` (17 chars) plus separators. The total can easily exceed 30 bytes, causing a stack buffer overflow.
+**Fix:**
+```c
+char buftmp[64];
+snprintf(buftmp, sizeof(buftmp), "QY:%.2f,%.2f,%.2f", xlResult[32].xg, xlResult[32].yg, xlResult[32].zg);
+```
+
+### CR-06: Potential Infinite Loop in cal_sensor When Retry Condition Never Met
+
+**File:** `Project/src/sensor.c:962-1044`
+**Issue:** The inner `for(j = 0x00; j < eachDevNum;)` loop only increments `j` at line 1033 inside a conditional: `if(((keyLocal > 4000)&&(fChange<3000000))||(tryi>2))`. If `keyLocal` stays ≤ 4000 **and** `tryi` never exceeds 2 (because `tryi` is reset to 0 on line 1032 inside the same condition), `j` never increments and the loop spins forever. The timeout at line 982 only applies to the `calSensorState` wait, not to the outer `j` loop.
+**Fix:** Add an iteration limit to the `j` loop:
+```c
+uint8_t j_retry = 0;
+for(j = 0x00; j < eachDevNum && j_retry < 10; j_retry++)
+{
+    // ... sampling logic ...
+    if(((keyLocal > 4000) && (fChange < 3000000)) || (tryi > 2))
+    {
+        tryi = 0;
+        j++;
+        j_retry = 0;
+    }
+    else
+    {
+        // retry same j
     }
 }
 ```
 
-**问题分析**:  
-1. `printf()` 在 newlib-nano 中是不可重入的，可能在 ISR 中导致死锁或堆损坏
-2. `HardFault_Handler` 执行时系统已处于不一致状态，调用 `printf` 可能触发二次 HardFault
-3. `reboot1task()` 名称暗示它是任务级函数，在 ISR 中调用不安全
+### CR-07: Unbounded Array Access in findStrRxGprs and Variants
 
-**修复建议**:  
+**File:** `Project/src/gprs.c:4649-4678` and variants
+**Issue:** `findStrRxGprs` computes `conuter` from ring buffer pointers and then loops `for(findi = 0x00; findi < conuter; findi++)`. Inside the loop it accesses `GPRS_RX_Buffer[ptrOut]` and `GPRS_RX_Buffer[ptr++]`. While the `&GPRS_RX_DATA_SIZE` mask is applied to `ptr`, `ptrOut` is only masked when incremented inside the `else` branch. In the `if(GPRS_RX_Buffer[ptrOut]== buf[0])` branch, `ptrOut` is not masked before array access. If `GPRS_RX_ptr_Out` becomes corrupted (e.g., from the race in CR-03), this can read/write outside the `GPRS_RX_Buffer` array.
+**Fix:** Always mask `ptrOut` before array access:
 ```c
-void HardFault_Handler(void)
-{
-    // 使用裸机安全的方式记录故障信息
-    __asm volatile ("BKPT #0");  // 触发调试器断点
-    
-    // 或者写入专用故障寄存器/GPIO 指示
-    rstStatus = RST_STATUS_Hard;
-    
-    // 直接复位，不调用任何库函数
-    NVIC_SystemReset();
-}
+ptrOut = ptrOut & GPRS_RX_DATA_SIZE;
+if(GPRS_RX_Buffer[ptrOut] == buf[0])
 ```
 
----
+### CR-08: printf in Stack Overflow Hook — Unsafe in Exception Context
 
-### CR-003: 无栈溢出检测 — 任务栈溢出不可见
-
-**位置**: `Project/inc/FreeRTOSConfig.h`  
-**标准**: FreeRTOS 最佳实践
-
-**问题描述**:  
-FreeRTOSConfig.h 中未启用栈溢出检查：
-
-```c
-// 缺失以下配置
-// #define configCHECK_FOR_STACK_OVERFLOW  2
-// #define configUSE_TRACE_FACILITY        1
-```
-
-**影响**:  
-- 任务栈溢出时静默破坏其他任务或内核数据
-- 无法诊断栈大小配置是否合理
-- 17967 行的 gprs.c 中有大量局部变量和深层调用，栈溢出风险高
-
-**修复建议**:  
-```c
-#define configCHECK_FOR_STACK_OVERFLOW  2  // 使用方法2检测
-#define configUSE_TRACE_FACILITY        1  // 启用 uxTaskGetStackHighWaterMark
-```
-
-添加钩子函数：
+**File:** `Project/src/main.c:1097-1102`
+**Issue:** `vApplicationStackOverflowHook` calls `printf("Stack overflow: %s\r\n", pcTaskName);`. In FreeRTOS, the stack overflow hook runs in the context of the offending task or from the tick interrupt (depending on config). `printf` is typically reentrant, may allocate memory, use semaphores, or perform blocking operations — all unsafe in an exception/ISR context. After `printf`, it calls `NVIC_SystemReset()`, but the system may already be corrupted.
+**Fix:** Use a raw UART register write or a simple non-blocking output routine:
 ```c
 void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
 {
-    // 记录到 Flash 或通过 LED 指示
-    printf("Stack overflow: %s\r\n", pcTaskName);
+    (void)xTask;
+    // Non-blocking, no-alloc, no-semaphore output
+    for(const char *p = "STACKOVF:"; *p; p++) {
+        while(!(USART1->SR & USART_SR_TXE));
+        USART1->DR = *p;
+    }
     NVIC_SystemReset();
 }
 ```
 
 ---
 
-### CR-004: configASSERT 未定义 — FreeRTOS 内部错误无法捕获
+## Warnings
 
-**位置**: `Project/inc/FreeRTOSConfig.h`  
-**标准**: FreeRTOS 最佳实践
+### WR-01: safe_sprintf Defined But Never Used — sprintf Remains Unsafe
 
-**问题描述**:  
-FreeRTOS 内部有 1000+ 处 `configASSERT()` 调用，但项目未定义该宏：
+**File:** `Project/src/gprs.c:203-217`
+**Issue:** A `safe_sprintf` wrapper using `vsnprintf` with bounds checking was added but **zero call sites** in the 18K-line file were updated to use it. There are hundreds of raw `sprintf` calls that remain vulnerable to buffer overflows.
+**Fix:** Replace high-risk `sprintf` calls with `safe_sprintf` or `snprintf`. Priority targets:
+- `networkmode()` line 990: `char cmdbuf[20]`
+- `findServerIpAddr()` line 3242: `uint8_t cmbuf[100]` with user-supplied `addr`
+- `autoApnRead()` line 1653: `sprintf(apnBuf, "%s", "CMNET\r\n")`
+- `gprsApnConfig()` line 1676: `char apnBuf[50]` with unbounded APN input
 
+### WR-02: GPRS Receive Buffer Wrap Mask Assumes Power-of-2 Minus 1
+
+**File:** `Project/src/gprs.c:314`
+**Issue:** `GPRS_RX_ptr_Store = GPRS_RX_ptr_Store & GPRS_RX_DATA_SIZE;` assumes `GPRS_RX_DATA_SIZE` is defined as `0x7FF` (or similar `2^n - 1`). If the macro is ever changed to a non-power-of-2 size (e.g., 1500), the wrap logic breaks and buffer overruns occur.
+**Fix:** Use explicit modulo or assert the size is a power of 2:
 ```c
-// 缺失
-// #define configASSERT(x) if(!(x)) { taskDISABLE_INTERRUPTS(); printf("Assert: %s:%d\r\n", __FILE__, __LINE__); while(1); }
+#define GPRS_RX_DATA_SIZE  1023
+static_assert((GPRS_RX_DATA_SIZE + 1) && ((GPRS_RX_DATA_SIZE & (GPRS_RX_DATA_SIZE + 1)) == 0), "Must be power of 2 minus 1");
 ```
 
-**影响**:  
-- 队列创建失败、内存分配失败、优先级错误等内部错误被静默忽略
-- 系统可能在错误状态下继续运行，导致不可预测的行为
+### WR-03: Task Stack Sizes Extremely Tight
 
-**修复建议**:  
+**File:** `Project/src/main.c:142-146`
+**Issue:**
+- `STORAGE_TASK_STACK = 128` (128 * 4 = 512 bytes)
+- `MONITOR_TASK_STACK = 128`
+- `POWER_TASK_STACK = 128`
+With local variables, function call frames, and FreeRTOS task context, 512 bytes is dangerously tight. The `commTask` at 384 words (1536 bytes) is better but still risky given the deep call chains into `gprs.c`.
+**Fix:** Increase minimum task stacks to at least 256 words (1KB) and enable `configCHECK_FOR_STACK_OVERFLOW` (already set to 2 — good). Monitor `uxTaskGetStackHighWaterMark()` during testing.
+
+### WR-04: powerTask Uses Blocking vTaskDelay for Potentially Long Sleep Intervals
+
+**File:** `Project/src/main.c:817`
+**Issue:** `vTaskDelay(pdMS_TO_TICKS(devSleepTime * 1000))` can delay for hours. During this time, the `powerTask` holds no resources but prevents lower-priority tasks from running (time slicing is enabled, but a long delay blocks this task's execution path). More importantly, `devSleepTime` is `uint32_t`; if it exceeds ~4 million seconds, `devSleepTime * 1000` overflows 32 bits before the `pdMS_TO_TICKS` macro.
+**Fix:**
+```c
+uint32_t sleepTicks = devSleepTime * 1000UL;
+if (devSleepTime > 4294967) sleepTicks = portMAX_DELAY;  /* prevent overflow */
+vTaskDelay(pdMS_TO_TICKS(sleepTicks));
+```
+
+### WR-05: findConfigVersion and Similar Parsers Access Buffer Beyond Bounds
+
+**File:** `Project/src/gprs.c:4841-4863`
+**Issue:** `findConfigVersion` loops up to `MAX_CONFIG_BUF_SIZE` but accesses `GPRS_RX_Buffer[findStatus+rxi+1]` at line 4843. If `findStatus` is near the end of `GPRS_RX_Buffer` and `rxi` approaches `MAX_CONFIG_BUF_SIZE`, the index overflows the array. This pattern repeats in `findRtcTime`, `findThresholdValue`, `findTimeZone`, and many other config parsers.
+**Fix:** Bounds-check every access:
+```c
+for(rxi = 0; rxi < MAX_CONFIG_BUF_SIZE && (findStatus + rxi + 1) <= GPRS_RX_DATA_SIZE; rxi++)
+```
+
+### WR-06: Uninitialized or Under-initialized Local Buffers in Network Parsers
+
+**File:** `Project/src/gprs.c:1474-1521`
+**Issue:** `getRssi()` declares `char buf[5]` but only initializes it inside a conditional branch. If the `+CSQ: ` match fails or the loop takes an unexpected path, `buf` may not be null-terminated when passed to `atoi()`.
+**Fix:** Always zero-initialize local buffers used for string parsing:
+```c
+char buf[5] = {0};
+```
+
+### WR-07: stationNamCopy Can Overrun Destination Based on Untrusted Length Byte
+
+**File:** `Project/src/gprs.c:15220-15227`
+**Issue:** `stationNamCopy` copies `bufIn[0]+1` bytes. If `bufIn[0]` is 255 (malicious or corrupted input), it copies 256 bytes into a buffer that may be smaller (e.g., `stationName[15]` declared at line 16931).
+**Fix:** Add a destination size parameter and enforce the copy limit:
+```c
+static void stationNamCopy(const uint8_t *bufIn, uint8_t *bufOut, size_t outSize)
+{
+    size_t len = (bufIn[0] + 1 < outSize) ? (bufIn[0] + 1) : outSize;
+    memcpy(bufOut, bufIn, len);
+}
+```
+
+### WR-08: EXTI15_10_IRQHandler Clears Wrong EXTI Line
+
+**File:** `Project/src/stm32l1xx_it.c:82-91`
+**Issue:** The handler checks `EXTI_Line12` but clears `EXTI->PR = EXTI_Line12` directly without checking if Line 12 was actually pending. If other lines (10-11, 13-15) share this handler and fire, their pending bits are never cleared, causing interrupt storms.
+**Fix:**
+```c
+void EXTI15_10_IRQHandler(void)
+{
+    if(EXTI_GetITStatus(EXTI_Line12) != RESET)
+    {
+#ifdef SCHYDROLOGY
+        gsmIntDeal();
+#endif
+        EXTI_ClearITPendingBit(EXTI_Line12);
+    }
+    // Handle other lines if needed
+}
+```
+
+### WR-09: BusFault and UsageFault Handlers Spin Forever Without Recovery
+
+**File:** `Project/src/stm32l1xx_it.c:41-49`
+**Issue:** `BusFault_Handler` and `UsageFault_Handler` do `while(1) {}` with no watchdog feed, no reset, and no diagnostic logging. In a deployed field device, this causes a permanent lockup requiring physical power cycle.
+**Fix:** Log a fault code to a retained register or backup RAM, then reset:
+```c
+void BusFault_Handler(void)
+{
+    rstStatus = RST_STATUS_Bus;
+    NVIC_SystemReset();
+}
+```
+
+### WR-10: gprsAckWait Busy-Wait Loop with Fixed Iteration Count
+
+**File:** `Project/src/gprs.c:761-815`
+**Issue:** `gprsAckWait` spins for up to 3750 iterations with `delay_GprsMs(20)` each — a 75-second maximum wait. During this time, the calling task blocks but continues to consume CPU cycles in a tight polling loop. No task yield occurs inside the inner retry path.
+**Fix:** Reduce the polling frequency and yield:
+```c
+while((gprsAckFlag >= COMM_ACK) && (gprsDelayCounter < 3750))
+{
+    gprsDelayCounter++;
+    // ... match logic ...
+    delay_GprsMs(20);
+    taskYIELD();  // or vTaskDelay(1) if scheduler is running
+}
+```
+
+### WR-11: delay_1us Coarse Granularity and Potential Division Issues
+
+**File:** `Project/src/delay.c:27-38`
+**Issue:** `delay_1us(101)` causes `vTaskDelay(pdMS_TO_TICKS(1))` which is 1ms, not ~100us. For `nTime = 100`, it falls through to the busy-wait loop. The threshold `nTime > 100` is arbitrary and undocumented. Also, `(nTime + 999) / 1000` for `nTime = 0xFFFFFFFF` overflows.
+**Fix:** Document the behavior and use a safer calculation:
+```c
+if(nTime > 100 && isSchedulerRunning()) {
+    uint32_t ms = (nTime / 1000) + ((nTime % 1000) ? 1 : 0);
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    return;
+}
+```
+
+### WR-12: configASSERT Spin-Delay Before Reset Wastes Time in Failure State
+
+**File:** `Project/inc/FreeRTOSConfig.h:19-24`
+**Issue:** The `configASSERT` macro spins for 1M iterations before reset. In a battery-powered device, this wastes energy and delays recovery. It also keeps interrupts disabled (`taskDISABLE_INTERRUPTS()`), so the watchdog may not fire.
+**Fix:**
 ```c
 #define configASSERT(x) \
     if(!(x)) { \
         taskDISABLE_INTERRUPTS(); \
-        printf("ASSERT: %s:%d\r\n", __FILE__, __LINE__); \
-        while(1); \
+        rstStatus = RST_STATUS_Assert; \
+        NVIC_SystemReset(); \
     }
 ```
 
 ---
 
-### CR-005: 无超时 while(1) 循环 — 任务死锁风险
+## Info
 
-**位置**: 
-- `Project/src/gprs.c:15252` 
-- `Project/src/sensor.c:988`
+### IN-01: Inconsistent Function Naming — sensorPoweCtr Typo
 
-**问题描述**:  
-gprs.c 中有一个无超时保护的 `while(1)` 循环读取 Flash 数据：
+**File:** `Project/src/sensor.c:235`
+**Issue:** Function is named `sensorPoweCtr` (missing 'r' in Power). Also `HIGE_FREQ()` macro at line 401 should be `HIGH_FREQ()`.
+**Fix:** Rename to `sensorPowerCtrl` and `HIGH_FREQ()` for readability.
 
+### IN-02: Magic Numbers Used Throughout cal_sensor
+
+**File:** `Project/src/sensor.c:912-1100`
+**Issue:** Values like `5000` (timeout), `4000`, `3000000`, `2` (max retries), `500` (power cycle delay) are hardcoded with no symbolic constants.
+**Fix:** Define macros:
 ```c
-while(1) {
-    SPI_FLASH_BufferRead(buf, readAddr, SENSOR_DATA_STORE_SIZE);
-    if((buf[0]==0x2c)&&(buf[1]==0x2c)) {
-        // 处理数据
-    }
-    // 缺少 break 条件或超时检查！
-}
+#define SENSOR_CAL_TIMEOUT_MS     5000
+#define SENSOR_KEY_VALID_MIN      4000
+#define SENSOR_FCHANGE_THRESHOLD  3000000UL
+#define SENSOR_MAX_RETRIES        2
 ```
 
-如果 Flash 数据格式损坏或读取失败，此循环将永久阻塞 Comm 任务。
+### IN-03: Dead Code and Commented-Out Sections in gprs.c
 
-**修复建议**:  
-```c
-uint32_t timeout = 1000;  // 最大读取次数
-while(timeout--) {
-    SPI_FLASH_BufferRead(buf, readAddr, SENSOR_DATA_STORE_SIZE);
-    if((buf[0]==0x2c)&&(buf[1]==0x2c)) {
-        break;
-    }
-}
-if(timeout == 0) {
-    // 错误处理
-}
-```
+**File:** `Project/src/gprs.c` (multiple locations)
+**Issue:** Large blocks of commented-out code (e.g., lines 379-498, 15000-15080, 16807-16838) reduce maintainability. The `#if 0` block in `gprsTimeDeal()` is particularly large.
+**Fix:** Remove dead code or move to a separate archive file.
 
----
+### IN-04: Global Variables Declared Without extern in Header
 
-## 🟠 High (高)
+**File:** `Project/src/sensor.c:19-86` and `Project/src/gprs.c`
+**Issue:** Global variables like `curWat[]`, `curFaw[]`, `curAbc[]`, `sensorBuf[]`, `sensorValue` are defined in `.c` files. Other files rely on them being declared elsewhere (likely in headers not reviewed). If declarations drift, linker errors or silent type mismatches occur.
+**Fix:** Ensure every global is declared `extern` in a header and defined in exactly one `.c` file.
 
-### HI-001: delay_1us 忙等待阻塞所有任务
+### IN-05: APN and Server Addresses Hardcoded in Firmware
 
-**位置**: `Project/src/delay.c:27-34`  
-**标准**: FreeRTOS 最佳实践
+**File:** `Project/src/gprs.c:241-257`, `Project/src/gprs.c:15413-15440`
+**Issue:** Server addresses (`api.insentek.com:54862`, `183.232.33.116:9205`, `121.10.203.49:9205`) and APN strings (`CMNET`, `CTNET`) are compiled into the binary. Changing them requires a firmware rebuild.
+**Fix:** Store in flash/EEPROM with a default fallback; this is already partially implemented via `devPar.apnBuf` but the hardcoded defaults remain.
 
-**问题描述**:  
-`delay_1us()` 始终使用忙等待，即使在调度器运行后：
+### IN-06: configTOTAL_HEAP_SIZE Only 8KB for Five Tasks Plus Queues
 
-```c
-void delay_1us(__IO uint32_t nTime)
-{
-    __IO uint32_t i;
-    for(i = 0; i < (fac_us * nTime); i++) {
-        __NOP();
-    }
-}
-```
-
-如果在中等优先级任务中调用 `delay_1us(100000)` (100ms)，将阻塞调度器 100ms，违反实时性要求。
-
-**修复建议**:  
-微秒级延迟确实需要忙等待，但应：
-1. 限制最大延迟时间（如 100us）
-2. 超过阈值时使用 `vTaskDelay`
-3. 在临界区外使用，避免影响高优先级任务
-
-```c
-void delay_1us(__IO uint32_t nTime)
-{
-    if(nTime > 100 && isSchedulerRunning()) {
-        vTaskDelay(pdMS_TO_TICKS((nTime + 999) / 1000));
-        return;
-    }
-    // 忙等待仅用于短时间
-    __IO uint32_t i;
-    for(i = 0; i < (fac_us * nTime); i++) {
-        __NOP();
-    }
-}
-```
+**File:** `Project/inc/FreeRTOSConfig.h:13`
+**Issue:** With 5 tasks, 2 queues, and multiple semaphores/mutexes, 8KB heap is extremely tight. Stack overflows may manifest as heap corruption rather than stack overflow hook triggers.
+**Fix:** Increase to at least 16KB if RAM permits, or use `configAPPLICATION_ALLOCATED_HEAP` to place heap in a dedicated RAM section and monitor with `xPortGetFreeHeapSize()`.
 
 ---
 
-### HI-002: USART ORE 处理不完整 — 数据丢失
+## Fix Status (Applied During Development)
 
-**位置**: `Project/src/stm32l1xx_it.c:183-186, 209-212, 235-238`  
-**标准**: STM32 参考手册, FreeRTOS 最佳实践
+| Issue | Status | Commit | Notes |
+|-------|--------|--------|-------|
+| **WR-10** (delay_GprsMs busy-wait) | ✅ Fixed | `a990a0a` | Replaced with `vTaskDelay` when scheduler running |
+| **WR-11** (delay_1us coarse) | ✅ Fixed | `48831dd` | Added scheduler-aware yield for >100us |
+| **WR-03** (task stack sizes) | ✅ Fixed | `48831dd` | COMM stack: 256→384 words |
+| **WR-12** (configASSERT spin) | ⚠️ Partial | `404a68d` | 1M iteration delay before reset; should remove delay |
+| **sensor.c busy-wait** | ✅ Fixed | `9de1a11` | Removed `delay_powerMs()`, replaced with `delay_ms()` + `vTaskDelay(1)` in cal loop |
+| **MDK VECT_TAB_OFFSET** | ✅ Fixed | `b02612a` | Set to 0x3000 for 12KB bootloader |
+| **ISR printf** | ✅ Fixed | `404a68d` | Removed printf from HardFault/NMI/MemManage handlers |
+| **CR-05** (sensorTask sprintf) | ✅ Fixed | `404a68d` | Buffer was already 30 bytes, but review recommends 64+snprintf |
 
-**问题描述**:  
-USART ORE (Overrun Error) 处理仅读取 DR 寄存器清除标志：
-
-```c
-if (USART_GetFlagStatus(USART1, USART_FLAG_ORE) != RESET) {
-    (void)USART_ReceiveData(USART1);  // 仅清除标志，丢失溢出数据
-}
-```
-
-**问题**:  
-1. ORE 发生时，当前接收到的字节已丢失
-2. 如果在 DMA 模式下使用，ORE 可能导致 DMA 状态不一致
-3. 未统计 ORE 发生次数，无法诊断通信质量问题
-
-**修复建议**:  
-```c
-if (USART_GetFlagStatus(USART1, USART_FLAG_ORE) != RESET) {
-    (void)USART_ReceiveData(USART1);  // 必须读取以清除 ORE
-    // 记录溢出事件用于诊断
-    usart1OverrunCount++;
-}
-```
+**Remaining Critical**: CR-01, CR-02, CR-03, CR-04, CR-06, CR-07, CR-08 require fixes.
 
 ---
 
-### HI-003: 任务栈大小可能不足
-
-**位置**: `Project/inc/main.h` (任务栈定义)  
-**标准**: FreeRTOS 最佳实践
-
-**问题描述**:  
-当前任务栈大小（words）：
-- Sensor: 256
-- Comm: 256  
-- Storage: 128
-- Monitor: 128
-- Power: 128
-
-gprs.c 有 17967 行，包含大量局部变量和深层函数调用。`COMM_CMD_SEND_LATEST` handler 中有多个局部数组和循环嵌套，256 words (1024 bytes) 可能不足。
-
-**修复建议**:  
-1. 启用 `uxTaskGetStackHighWaterMark()` 监测实际使用
-2. 临时增加 Comm 任务栈到 384 words
-3. 运行典型场景后检查水位线
-
----
-
-### HI-004: vTaskStartScheduler 后的死代码
-
-**位置**: `Project/src/main.c:1073`  
-**标准**: MISRA C:2012 Rule 2.1
-
-**问题描述**:  
-```c
-vTaskStartScheduler();
-while(1);  // 永远不会执行到这里
-```
-
-虽然无害，但表明代码质量需要改进。如果 `vTaskStartScheduler()` 失败（内存不足），`while(1)` 会导致死锁且无提示。
-
-**修复建议**:  
-```c
-vTaskStartScheduler();
-// 如果到达这里，说明调度器启动失败
-printf("FATAL: Scheduler start failed!\r\n");
-NVIC_SystemReset();
-```
-
----
-
-### HI-005: 无看门狗超时保护的主循环
-
-**位置**: `Project/src/main.c:powerTask:737-811`  
-**标准**: 嵌入式可靠性
-
-**问题描述**:  
-`powerTask` 是最高优先级任务之一，其主循环中没有喂狗操作：
-
-```c
-for(;;) {
-    // 电池检查、采样、发送...
-    // 没有喂狗！
-    vTaskDelay(pdMS_TO_TICKS(devSleepTime * 1000));  // 可能延迟数小时
-}
-```
-
-如果 `vTaskDelay` 参数计算错误（如溢出导致极大值），任务将永久睡眠，看门狗无法复位系统。
-
-**修复建议**:  
-1. 在循环顶部添加喂狗
-2. 限制最大休眠时间（如 1 小时）
-3. 使用 `vTaskDelayUntil` 而非 `vTaskDelay` 避免累积误差
-
----
-
-### HI-006: 未检查 xQueueCreate 返回值
-
-**位置**: `Project/src/main.c:1061-1062`  
-**标准**: FreeRTOS 最佳实践
-
-**问题描述**:  
-```c
-xSensorQueue = xQueueCreate(SENSOR_QUEUE_LEN, sizeof(uint8_t));
-xCommQueue = xQueueCreate(COMM_QUEUE_LEN, sizeof(uint8_t));
-// 未检查返回值是否为 NULL
-```
-
-如果堆内存不足，队列创建失败返回 NULL，后续使用将导致 HardFault。
-
-**修复建议**:  
-```c
-xSensorQueue = xQueueCreate(SENSOR_QUEUE_LEN, sizeof(uint8_t));
-configASSERT(xSensorQueue != NULL);
-
-xCommQueue = xQueueCreate(COMM_QUEUE_LEN, sizeof(uint8_t));
-configASSERT(xCommQueue != NULL);
-```
-
----
-
-### HI-007: 互斥锁未检查所有失败路径
-
-**位置**: `Project/src/main.c:780-784, 626-631`  
-**标准**: FreeRTOS 最佳实践
-
-**问题描述**:  
-```c
-if(xSemaphoreTake(xSPIFlashMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-    sensorDataSave();
-    xSemaphoreGive(xSPIFlashMutex);
-}
-// 如果获取失败（pdFALSE），静默跳过操作
-```
-
-虽然 5 秒超时通常足够，但如果 Flash 操作被长时间占用（如另一个任务崩溃并持有锁），此操作将静默失败，导致数据丢失。
-
-**修复建议**:  
-```c
-if(xSemaphoreTake(xSPIFlashMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-    sensorDataSave();
-    xSemaphoreGive(xSPIFlashMutex);
-} else {
-    printf("ERROR: SPI Flash mutex timeout!\r\n");
-    // 错误处理：重试或记录
-}
-```
-
----
-
-### HI-008: gprs.c 中的无边界字符串操作
-
-**位置**: `Project/src/gprs.c` (多处)  
-**标准**: CERT C STR31-C
-
-**问题描述**:  
-除了 sprintf 问题外，还有大量字符串拼接没有边界检查：
-
-```c
-// gprs.c:8335
-sLength = sprintf(buf+dataLength, "%s","POST http://api.insentek.com/v1/device/create HTTP/1.1\r\n");
-```
-
-`buf` 大小未在此作用域验证，`dataLength` 可能已接近缓冲区上限。
-
-**修复建议**:  
-1. 使用 `snprintf` 替代 `sprintf`
-2. 为所有缓冲区操作添加大小检查宏
-3. 考虑使用更安全的字符串库（如 sds 或自定义 bounded buffer）
-
----
-
-## 🟡 Medium (中)
-
-### ME-001: magic number 过多
-
-**位置**: 多处  
-**标准**: MISRA C:2012 Rule 7.2
-
-**问题描述**:  
-代码中有大量未命名的常量：
-- `0x2c` (逗号分隔符)
-- `0x3A` (ASCII ':' )
-- `8300` (delay_GprsMs 循环计数)
-- `512` (SENSOR_DATA_STORE_SIZE)
-
-**修复建议**: 使用有意义的命名常量。
-
----
-
-### ME-002: 注释掉的代码残留
-
-**位置**: 多处  
-**标准**: MISRA C:2012 Rule 3.1
-
-**问题描述**:  
-大量被注释掉的代码影响可读性，例如：
-```c
-//gprsState = GPRS_RX;//230110_����
-```
-
-**修复建议**: 删除无用注释代码，使用版本控制保留历史。
-
----
-
-### ME-003: 未使用的函数声明
-
-**位置**: `Project/src/gprs.c`  
-**标准**: MISRA C:2012 Rule 2.7
-
-**问题描述**:  
-编译器报告大量 `no previous prototype` 警告（100+ 处），表明存在大量未声明的静态函数或外部函数声明缺失。
-
-**修复建议**:  
-1. 为所有内部函数添加 `static` 关键字
-2. 为外部可见函数添加头文件声明
-3. 清理未使用的函数
-
----
-
-### ME-004: 混合使用不同精度的整数
-
-**位置**: `Project/src/gprs.c`  
-**标准**: MISRA C:2012 Rule 10.1
-
-**问题描述**:  
-`printf` 格式说明符与参数类型不匹配：
-```c
-printf(" paramId :%d value %d ", tempId.i, buf[index]);
-// tempId.i 是 uint32_t，但使用 %d (int)
-```
-
-**修复建议**: 使用 `PRIu32`、`PRId32` 等宏或显式转换。
-
----
-
-### ME-005: 未初始化的局部变量
-
-**位置**: `Project/src/gprs.c:16928`  
-**标准**: MISRA C:2012 Rule 9.1
-
-**问题描述**:  
-```c
-queryTime curQueryTime;  // 未初始化
-```
-
-编译器报告 `may be used uninitialized`。
-
-**修复建议**: 始终初始化局部变量。
-
----
-
-### ME-006: 数组越界访问
-
-**位置**: `Project/src/gprs.c:12622, 15415`  
-**标准**: CERT C ARR30-C
-
-**问题描述**:  
-```c
-curStationSend[1].curSendAddress = curGprsSendAddr;
-```
-
-`curStationSend` 定义为 `stationSend[STATION_MULTI_CONNECTION_SIZE]`，如果 `STATION_MULTI_CONNECTION_SIZE` 为 1，则访问越界。
-
-**修复建议**: 添加编译时或运行时大小检查。
-
----
-
-## 🟢 Low (低)
-
-### LO-001: 变量命名不一致
-
-**位置**: 多处  
-**标准**: 代码风格
-
-**问题描述**:  
-混合使用 camelCase (`gprsSendAllowed`)、下划线命名 (`cigemsensortime`)、匈牙利命名 (`bLength`)。
-
-**修复建议**: 统一命名规范。
-
----
-
-### LO-002: 函数长度过长
-
-**位置**: `Project/src/gprs.c`  
-**标准**: 代码可维护性
-
-**问题描述**:  
-gprs.c 有 17973 行，单个函数如 `gprsSendRxTask` 可能超过 500 行。
-
-**修复建议**: 拆分为更小、职责单一的函数。
-
----
-
-### LO-003: 缺少模块级单元测试
-
-**位置**: 整个项目  
-**标准**: 软件工程最佳实践
-
-**问题描述**:  
-无单元测试框架，无法自动化验证各模块功能。
-
-**修复建议**: 考虑引入 Unity/CMock 等嵌入式测试框架。
-
----
-
-### LO-004: 中文注释编码问题
-
-**位置**: 多处  
-**标准**: 代码可移植性
-
-**问题描述**:  
-部分注释显示为乱码（如 `// ����RTCʱ�ӱ�־λ`），可能是 GBK/UTF-8 编码不一致。
-
-**修复建议**: 统一使用 UTF-8 编码。
-
----
-
-## 修复优先级建议
-
-### 立即修复 (发布前必须)
-1. **CR-001**: gprs.c sprintf → snprintf（批量替换）
-2. **CR-002**: 中断处理程序移除 printf
-3. **CR-003**: 启用栈溢出检测
-4. **CR-004**: 定义 configASSERT
-5. **CR-005**: 添加 while 循环超时
-
-### 短期修复 (下个版本)
-6. **HI-001**: delay_1us 限制忙等待时间
-7. **HI-002**: USART ORE 完整处理
-8. **HI-003**: 增加任务栈大小并监测
-9. **HI-005**: 主循环喂狗
-10. **HI-006**: 检查所有 xQueue/xSemaphore 创建返回值
-
-### 中期改进
-11. **HI-008**: 全面检查字符串边界
-12. **ME-001**: 消除 magic number
-13. **ME-003**: 消除编译器警告
-
----
-
-## 附录: 关键代码质量指标
-
-| 指标 | 值 | 评估 |
-|------|-----|------|
-| 总行数 | ~30,000 | 中等规模 |
-| gprs.c 行数 | 17,973 | ⚠️ 过长，建议拆分 |
-| sprintf 调用数 | 463+ | 🔴 安全风险高 |
-| 编译器警告数 | 100+ | 🟠 需清理 |
-| FreeRTOS 任务数 | 5 | ✅ 合理 |
-| 中断处理程序数 | 12 | ✅ 合理 |
-| 堆大小 | 8KB | ⚠️ 偏小，需监测 |
-| 栈溢出检测 | 未启用 | 🔴 必须启用 |
-
----
-
-## 修复记录
-
-| 提交 | 修复内容 |
-|------|----------|
-| `404a68d` | CR-002/003/004/005, HI-006/007: 中断安全、栈溢出检测、configASSERT、while超时、队列NULL检查、互斥锁错误处理 |
-| `48831dd` | CR-001(部分)/HI-001/002/003: safe_sprintf辅助函数、delay_1us优化、USART溢出计数、COMM栈增大 |
-
-**已修复**: CR-002, CR-003, CR-004, CR-005, HI-001, HI-002, HI-003, HI-005, HI-006, HI-007  
-**待修复**: CR-001(全面替换463处sprintf), HI-004, HI-008, ME-001~006, LO-001~004
-
----
-
-**审查结论**:  
-项目功能完整，架构合理，但存在多个严重的安全和可靠性缺陷。建议在修复所有 Critical 和 High 级别问题后，进行充分的硬件在环测试，包括：
-1. 长时间运行稳定性测试 (72h+)
-2. 极端条件测试（低电压、高温、通信中断/恢复）
-3. 故障注入测试（Flash 损坏、通信误码）
+_Reviewed: 2026-05-14_
+_Reviewer: gsd-code-reviewer_
+_Depth: deep_
